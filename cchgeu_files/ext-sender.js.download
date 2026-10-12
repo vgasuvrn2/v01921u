@@ -1,0 +1,532 @@
+// ====== БАННЕР ВНЕШНЕГО ОТПРАВИТЕЛЯ (Samoware) ======
+
+(function() {
+    'use strict';
+
+    // ====== КОНФИГУРАЦИЯ ======
+    const CONFIG = {
+        DATA_URL: '/cgi-bin/data.app',
+    };
+
+    // ожидание логина, если скрипт загрузился до сессии (как у панели)
+    const SESSION_POLL_INTERVAL = 5000;
+
+    // паттерн URL письма в Samoware: /Session/<sid>/FORMAT/Samoware/<MAILBOX>/<UID>
+    const MAIL_URL_RE = /\/Session\/[^/]+\/FORMAT\/Samoware\//;
+
+    // домен: метки из букв/цифр/дефисов, разделённые точками
+    const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+    // ====== СОСТОЯНИЕ ======
+    let domains = null;       // нормализованный internal_domains или null (фича off)
+    let phishingKeywords = []; // нормализованный phishing_keywords (подстроки, lowercase)
+    let jqueryHooked = false;
+    let pollTimer = null;
+
+    // ====== ЗАПРОС JSON ======
+    function fetchJSON(url, callback) {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.timeout = 5000;
+        xhr.setRequestHeader('Accept', 'application/json');
+
+        xhr.onload = function() {
+            if (xhr.status !== 200) {
+                callback(null);
+                return;
+            }
+            try {
+                callback(JSON.parse(xhr.responseText));
+            } catch (e) {
+                console.error('Ошибка парсинга ответа ' + url + ':', e);
+                callback(null);
+            }
+        };
+        xhr.onerror = function() {
+            console.error('Ошибка сети (' + url + ')');
+            callback(null);
+        };
+        xhr.ontimeout = function() {
+            console.error('Таймаут (' + url + ')');
+            callback(null);
+        };
+
+        xhr.send();
+    }
+
+    // ====== ПРОВЕРКА СЕССИИ (как в panel.js) ======
+    function isSessionActive() {
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            cookie = cookie.trim();
+            if (cookie.startsWith('sessionid=') ||
+                cookie.startsWith('SessionID=') ||
+                cookie.startsWith('CGISESSID=')) {
+                return true;
+            }
+        }
+
+        if (window.storedSid || window.sessionInstance) {
+            return true;
+        }
+
+        const urlParams = new URLSearchParams(window.location.search);
+        return urlParams.has('sid') || urlParams.has('sessionid') || urlParams.has('SessionID');
+    }
+
+    // ====== КОНФИГ ИЗ DATA.APP ======
+    function applyClientConfig(section) {
+        domains = null;
+        phishingKeywords = [];
+        if (!section || typeof section !== 'object') return false;
+        if (section.ext_sender_enable !== true || !Array.isArray(section.internal_domains)) return false;
+
+        const list = [];
+        for (let i = 0; i < section.internal_domains.length; i++) {
+            const raw = section.internal_domains[i];
+            if (typeof raw !== 'string') continue;
+            const domain = raw.trim().toLowerCase();
+            if (DOMAIN_RE.test(domain) && list.indexOf(domain) < 0) list.push(domain);
+        }
+        if (!list.length) return false;
+
+        domains = list;
+
+        if (Array.isArray(section.phishing_keywords)) {
+            const seen = {};
+            for (let i = 0; i < section.phishing_keywords.length; i++) {
+                const raw = section.phishing_keywords[i];
+                if (typeof raw !== 'string') continue;
+                const kw = raw.trim().toLowerCase();
+                if (kw && !seen[kw]) {
+                    seen[kw] = true;
+                    phishingKeywords.push(kw);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ====== ПАРСИНГ RFC HTML ======
+    function parseEmailAddress(raw) {
+        let s = (raw || '').trim();
+        if (!s) return null;
+        const angle = s.match(/<([^<>\s]+@[^<>\s]+)>/);
+        if (angle) s = angle[1];
+        s = s.replace(/^mailto:/i, '');
+        const m = s.match(/^([^\s@<>,;"]+)@([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])$/);
+        if (!m) return null;
+        return { address: s.toLowerCase(), domain: m[2].toLowerCase() };
+    }
+
+    // Полный разбор From: адрес + домен + отображаемое имя (до <...> или в (...)).
+    function parseSender(raw) {
+        const s = (raw || '').trim();
+        if (!s) return null;
+        let name = '';
+        let addrPart = s;
+        const angle = s.match(/<([^<>\s]+@[^<>\s]+)>/);
+        if (angle) {
+            name = s.slice(0, angle.index).trim();
+            addrPart = angle[1];
+        } else {
+            const paren = s.match(/\(([^()]*)\)$/);
+            if (paren) {
+                name = paren[1].trim();
+                addrPart = s.slice(0, paren.index).trim();
+            }
+        }
+        name = name.replace(/^["']|["']$/g, '').trim();
+        addrPart = addrPart.replace(/^mailto:/i, '');
+        const m = addrPart.match(/^([^\s@<>,;"]+)@([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])$/);
+        if (!m) return null;
+        return { address: addrPart.toLowerCase(), domain: m[2].toLowerCase(), name: name.toLowerCase() };
+    }
+
+    function extractFromRfcHtml(html) {
+        const out = [];
+        const seen = {};
+        const cells = html.match(/<td[^>]*class="rfcfieldname"[^>]*>[^<]*<\/td>/gi);
+        if (!cells) return out;
+
+        for (let i = 0; i < cells.length; i++) {
+            const text = cells[i].replace(/<[^>]+>/g, '').trim().toLowerCase();
+            if (text !== 'from') continue;
+            const fromIdx = html.indexOf(cells[i]);
+            const fieldValueStart = html.indexOf('rfcfieldvalue', fromIdx);
+            if (fieldValueStart < 0) continue;
+            // Находим закрывающий </td> этой ячейки, чтобы не захватить To/Cc
+            const tdEnd = html.indexOf('</td>', fieldValueStart);
+            const segmentEnd = tdEnd > fieldValueStart ? tdEnd : fieldValueStart + 2000;
+            const segment = html.substring(fieldValueStart, segmentEnd);
+            const addresses = segment.match(/<div class="address_value">[^<]+<\/div>/gi);
+            if (!addresses) continue;
+            for (let j = 0; j < addresses.length; j++) {
+                const val = addresses[j].replace(/<[^>]+>/g, '').trim();
+                const addr = parseSender(val);
+                if (addr && !seen[addr.address]) {
+                    seen[addr.address] = true;
+                    out.push(addr);
+                }
+            }
+        }
+        return out;
+    }
+
+    function isInternalDomain(domain) {
+        if (!domains) return false;
+        for (let i = 0; i < domains.length; i++) {
+            const d = domains[i];
+            if (domain === d || domain.slice(0 - d.length - 1) === '.' + d) return true;
+        }
+        return false;
+    }
+
+    // Возвращает совпавшее ключевое слово (lowercase) или null. Ищет подстроку
+    // регистронезависимо в имени + адресе (адрес покрывает локальную часть и домен).
+    function matchPhishingKeyword(sender) {
+        if (!phishingKeywords.length || !sender) return null;
+        const haystack = ((sender.name || '') + ' ' + (sender.address || '')).toLowerCase();
+        for (let i = 0; i < phishingKeywords.length; i++) {
+            if (haystack.indexOf(phishingKeywords[i]) >= 0) return phishingKeywords[i];
+        }
+        return null;
+    }
+
+    // ====== ЗАПРОС RFC HTML И ОБРАБОТКА ======
+    function fetchAndParseMail(url) {
+        console.log('[ext-sender] fetch RFC HTML:', url);
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.timeout = 10000;
+        xhr.setRequestHeader('Accept', 'text/html');
+
+        xhr.onload = function() {
+            if (xhr.status !== 200) {
+                console.log('[ext-sender] RFC ответ:', xhr.status);
+                return;
+            }
+            processRfcResponse(xhr.responseText);
+        };
+        xhr.onerror = function() {
+            console.log('[ext-sender] RFC ошибка сети:', url);
+        };
+        xhr.ontimeout = function() {
+            console.log('[ext-sender] RFC таймаут:', url);
+        };
+        xhr.send();
+    }
+
+    // ====== ПЕРЕХВАТ jQuery AJAX ======
+    // Samoware грузит письма через $.ajax. Ловим/ajaxComplete, если URL
+    // совпадает с паттерном письма — сами запрашиваем RFC HTML.
+    function hookJqueryAjax() {
+        if (jqueryHooked) return;
+        if (typeof jQuery === 'undefined' && typeof $ === 'undefined') {
+            console.log('[ext-sender] jQuery не найден, отложим хук');
+            return;
+        }
+        const jq = jQuery || $;
+        jq(document).ajaxComplete(function(event, xhr, settings) {
+            if (!settings || !settings.url) return;
+            if (!MAIL_URL_RE.test(settings.url)) return;
+            console.log('[ext-sender] AJAX письмо:', settings.url, 'status:', xhr.status);
+            if (xhr.status === 200 && xhr.responseText) {
+                processRfcResponse(xhr.responseText);
+            }
+        });
+        jqueryHooked = true;
+        console.log('[ext-sender] jQuery ajaxComplete хук установлен');
+    }
+
+    // ====== БАННЕР В IFRAME ПИСЬМА ======
+    const BANNER_ID = 'cgp-ext-banner';        // жёлтый: внешний отправитель
+    const PHISH_BANNER_ID = 'cgp-phish-banner'; // красный: имитация ВУЗа (фишинг)
+    const ANCHOR_SELECTOR = '.samoware-mail__content-main-div';
+
+    // CSS инжектится в iframe (жёлтый — внешний, красный — фишинг)
+    function injectStylesIntoDoc(doc) {
+        if (!doc || doc.getElementById('cgp-ext-style')) return;
+        const style = doc.createElement('style');
+        style.id = 'cgp-ext-style';
+        style.textContent =
+            '#' + BANNER_ID + '{' +
+                'display:flex;align-items:center;gap:8px;' +
+                'margin:0px 0px 1rem 0px;' +
+                'padding:10px 14px;' +
+                'border:1px solid #e0a800;' +
+                'border-left:4px solid #d4910a;' +
+                'border-radius:6px;' +
+                'background:#fff8e1;' +
+                'color:#5b4200;' +
+                'font-family:Arial,sans-serif;' +
+                'font-size:13px;' +
+                'line-height:1.4;' +
+            '}' +
+            '#' + BANNER_ID + ' .cgp-ext-icon{' +
+                'font-size:16px;' +
+                'flex-shrink:0;' +
+            '}' +
+            '#' + BANNER_ID + ' .cgp-ext-text b{' +
+                'color:#8a6200;' +
+            '}' +
+            '#' + PHISH_BANNER_ID + '{' +
+                'display:flex;align-items:center;gap:8px;' +
+                'margin:0px 0px 1rem 0px;' +
+                'padding:10px 14px;' +
+                'border:1px solid #c0392b;' +
+                'border-left:4px solid #a93226;' +
+                'border-radius:6px;' +
+                'background:#fdecea;' +
+                'color:#7b1f12;' +
+                'font-family:Arial,sans-serif;' +
+                'font-size:13px;' +
+                'line-height:1.4;' +
+            '}' +
+            '#' + PHISH_BANNER_ID + ' .cgp-ext-icon{' +
+                'font-size:16px;font-weight:bold;' +
+                'flex-shrink:0;' +
+            '}' +
+            '#' + PHISH_BANNER_ID + ' .cgp-ext-text b{' +
+                'color:#a93226;' +
+            '}';
+        (doc.head || doc.documentElement).appendChild(style);
+    }
+
+    function removeBannerFromDoc(doc, id) {
+        if (!doc) return;
+        const old = doc.getElementById(id);
+        if (old) old.remove();
+    }
+
+    function buildBannerElement(addresses) {
+        const banner = document.createElement('div');
+        banner.id = BANNER_ID;
+
+        const icon = document.createElement('span');
+        icon.className = 'cgp-ext-icon';
+        icon.textContent = '\u26A0';
+
+        const text = document.createElement('span');
+        text.className = 'cgp-ext-text';
+        const list = addresses.map(function(a) { return '<b>' + a.address + '</b>'; }).join(', ');
+        text.innerHTML = '\u0412\u043D\u0435\u0448\u043D\u0438\u0439 \u043E\u0442\u043F\u0440\u0430\u0432\u0438\u0442\u0435\u043B\u044C (' + list + ') \u2014 \u043D\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u044F\u0439\u0442\u0435 \u0447\u0443\u0432\u0441\u0442\u0432\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0435 \u0434\u0430\u043D\u043D\u044B\u0435.';
+
+        banner.appendChild(icon);
+        banner.appendChild(text);
+        return banner;
+    }
+
+    // Красный баннер «возможный фишинг»: внешний адрес имитирует ВУЗ.
+    function buildPhishingBannerElement(senders) {
+        const banner = document.createElement('div');
+        banner.id = PHISH_BANNER_ID;
+
+        const icon = document.createElement('span');
+        icon.className = 'cgp-ext-icon';
+        icon.textContent = '!';
+
+        const text = document.createElement('span');
+        text.className = 'cgp-ext-text';
+        const list = senders.map(function(s) { return '<b>' + s.address + '</b>'; }).join(', ');
+        text.innerHTML = 'Внешний отправитель (' + list + ') — Это не безопасное письмо, почтовый адрес не принадлежит ВГТУ. Убедитесь что вы ТОЧНО знаете отправителя прежде чем отвечать или использовать информацию из этого письма';
+
+        banner.appendChild(icon);
+        banner.appendChild(text);
+        return banner;
+    }
+
+    // Вставка с ожиданием Angular-рендера через MutationObserver.
+    // pendingBanners — список {id, buildFn}, чтобы за раз можно было показать
+    // и жёлтый, и красный баннер (разные id не конфликтуют).
+    let pendingBanners = [];
+    let bodyObserver = null;
+
+    function showBannerCommon(id, buildFn) {
+        const iframe = getMailIframe();
+        if (!iframe) {
+            console.log('[ext-sender] showBanner: iframe не найден');
+            return;
+        }
+        try {
+            const doc = getIframeDoc(iframe);
+            if (!doc || !doc.body) {
+                console.log('[ext-sender] showBanner: doc/body недоступен');
+                return;
+            }
+            removeBannerFromDoc(doc, id);
+            pendingBanners.push({ id: id, buildFn: buildFn });
+
+            if (tryInsertAll(doc)) return;
+
+            console.log('[ext-sender] showBanner: элемент не найден, запускаем MutationObserver на iframe body');
+            startBodyObserver(doc);
+        } catch (e) {
+            console.log('[ext-sender] showBanner error:', e.message);
+        }
+    }
+
+    function showBanner(addresses) {
+        showBannerCommon(BANNER_ID, function() { return buildBannerElement(addresses); });
+    }
+
+    function showPhishingBanner(senders) {
+        showBannerCommon(PHISH_BANNER_ID, function() { return buildPhishingBannerElement(senders); });
+    }
+
+    function tryInsertAll(doc) {
+        const anchor = doc.querySelector(ANCHOR_SELECTOR);
+        if (!anchor) return false;
+        injectStylesIntoDoc(doc);
+        for (let i = pendingBanners.length - 1; i >= 0; i--) {
+            const item = pendingBanners[i];
+            removeBannerFromDoc(doc, item.id);
+            anchor.insertBefore(item.buildFn(), anchor.firstChild);
+            pendingBanners.splice(i, 1);
+        }
+        return true;
+    }
+
+    function startBodyObserver(doc) {
+        stopBodyObserver();
+        let attempts = 0;
+        const maxAttempts = 50; // 50 * 200ms = 10 сек макс
+
+        bodyObserver = new MutationObserver(function() {
+            attempts++;
+            if (tryInsertAll(doc)) {
+                stopBodyObserver();
+            } else if (attempts >= maxAttempts) {
+                console.log('[ext-sender] MutationObserver: превышен лимит попыток');
+                stopBodyObserver();
+            }
+        });
+        bodyObserver.observe(doc.body, { childList: true, subtree: true });
+
+        // Первый ручной тик на случай если Angular уже отрендерил
+        setTimeout(function tick() {
+            if (tryInsertAll(doc)) {
+                stopBodyObserver();
+            } else if (attempts < maxAttempts) {
+                setTimeout(tick, 200);
+            }
+        }, 200);
+    }
+
+    function stopBodyObserver() {
+        if (bodyObserver) {
+            bodyObserver.disconnect();
+            bodyObserver = null;
+        }
+    }
+
+    function removeExistingBanner() {
+        pendingBanners = [];
+        stopBodyObserver();
+        const iframe = getMailIframe();
+        if (iframe) {
+            try {
+                const doc = getIframeDoc(iframe);
+                removeBannerFromDoc(doc, BANNER_ID);
+                removeBannerFromDoc(doc, PHISH_BANNER_ID);
+            } catch (e) { /* ok */ }
+        }
+    }
+
+    function getMailIframe() {
+        return document.querySelector('iframe.js-mail-content');
+    }
+
+    function getIframeDoc(iframe) {
+        return iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+    }
+
+    // ====== ОБРАБОТКА RFC ОТВЕТА ======
+    function processRfcResponse(html) {
+        removeExistingBanner();
+        const addresses = extractFromRfcHtml(html);
+        console.log('[ext-sender] From-адреса:', addresses);
+        if (!addresses.length) return;
+
+        for (let i = 0; i < addresses.length; i++) {
+            const internal = isInternalDomain(addresses[i].domain);
+            console.log('[ext-sender]', addresses[i].address, '→', addresses[i].domain, internal ? 'ВНУТРЕННИЙ' : 'ВНЕШНИЙ');
+        }
+
+        const external = addresses.filter(function(a) { return !isInternalDomain(a.domain); });
+        if (!external.length) {
+            console.log('[ext-sender] все адреса внутренние');
+            return;
+        }
+
+        const phishing = external.filter(function(a) { return matchPhishingKeyword(a) !== null; });
+        const normalExternal = external.filter(function(a) { return matchPhishingKeyword(a) === null; });
+
+        if (phishing.length) {
+            console.log('[ext-sender] ФИШИНГ (имитация ВУЗа):', phishing.map(function(a) { return a.address; }).join(', '));
+            showPhishingBanner(phishing);
+        }
+        if (normalExternal.length) {
+            console.log('[ext-sender] ВНЕШНИЕ:', normalExternal.map(function(a) { return a.address; }).join(', '));
+            showBanner(normalExternal);
+        }
+    }
+
+    // ====== ЗАПУСК ======
+    function init() {
+        console.log('[ext-sender] init: загрузка data.app...');
+        fetchJSON(CONFIG.DATA_URL, function(response) {
+            console.log('[ext-sender] data.app ответ:', response);
+            if (!response || typeof response !== 'object' || response.enable !== true) {
+                console.log('[ext-sender] gate: response.enable !== true, стоп');
+                return;
+            }
+            const panel = response.client && response.client.panel;
+            console.log('[ext-sender] client.panel:', panel);
+            if (!applyClientConfig(panel)) {
+                console.log('[ext-sender] gate: applyClientConfig вернул false, стоп');
+                return;
+            }
+            console.log('[ext-sender] domains:', domains);
+
+            if (isSessionActive()) {
+                console.log('[ext-sender] сессия активна, hookJqueryAjax');
+                hookJqueryAjax();
+                return;
+            }
+
+            console.log('[ext-sender] сессии нет, pollTimer запущен');
+            pollTimer = setInterval(function() {
+                if (isSessionActive()) {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    console.log('[ext-sender] сессия появилась, hookJqueryAjax');
+                    hookJqueryAjax();
+                }
+            }, SESSION_POLL_INTERVAL);
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+    // Тестовый экспорт
+    if (typeof window !== 'undefined') {
+        window.__CGP_EXT_TEST__ = {
+            applyClientConfig: applyClientConfig,
+            isSessionActive: isSessionActive,
+            parseEmailAddress: parseEmailAddress,
+            parseSender: parseSender,
+            extractFromRfcHtml: extractFromRfcHtml,
+            isInternalDomain: isInternalDomain,
+            matchPhishingKeyword: matchPhishingKeyword,
+            processRfcResponse: processRfcResponse,
+            isActive: function() { return domains !== null && jqueryHooked; },
+            isWatching: function() { return jqueryHooked; }
+        };
+    }
+
+})();

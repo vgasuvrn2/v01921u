@@ -1,0 +1,1083 @@
+// ====== ПАНЕЛЬ ДАТЫ И СЕРВИСОВ ======
+//
+// Режимы:
+//   - страница логина: компактная карточка (дата · паритет · время),
+//     клик по ней ведёт на date.cchgeu.ru;
+//   - активная сессия: интерактивный режим — на десктопе ховер
+//     разворачивает сетку сервисов, клик по дате ведёт на date.cchgeu.ru;
+//     на мобильном тап открывает фулскрин-оверлей со сервисами.
+//
+(function() {
+    'use strict';
+
+    // ====== КОНФИГУРАЦИЯ ======
+    // Единственная константа — точка входа. Остальное (URL'ы и тайминги)
+    // приходит из data.app: секция client.panel собирается на сервере из data.json.
+    const CONFIG = {
+        DATA_URL: '/cgi-bin/data.app',
+        TIMEOUT: 5000,
+    };
+
+    // Паритет принимаем только из whitelist'а, остальное игнорируем
+    const PARITY_WHITELIST = ['числитель', 'знаменатель'];
+
+    // ====== СОСТОЯНИЕ ======
+    let interactive = false;          // сессия активна (индикатор + сервисы)
+    let clientInternal = false;       // клиент из сети университета
+
+    let parityMode = null;            // 'числитель' | 'знаменатель' | null
+    let timeOffsetMs = null;          // смещение серверного времени от клиентского
+
+    let servicesItems = null;         // нормализованный список или null
+    let servicesFetching = false;
+    let servicesFetchFailedAt = 0;
+    let servicesPanelInitialized = false;
+    let servicesHideTimer = null;
+
+    let sessionPollTimer = null;
+
+    // ====== НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ ======
+    const SETTINGS_KEYS = {
+        enabled:     'cgp-panel-enabled',
+        showParity:  'cgp-panel-show-parity',
+        showServices: 'cgp-panel-show-services',
+    };
+
+    function getPanelSettings() {
+        return {
+            enabled:      loadSetting('enabled'),
+            showParity:   loadSetting('showParity'),
+            showServices: loadSetting('showServices'),
+        };
+    }
+
+    function loadSetting(key) {
+        const raw = localStorage.getItem(SETTINGS_KEYS[key]);
+        if (raw === null) return true;
+        return raw === 'true';
+    }
+
+    function setPanelSettings(key, value) {
+        if (!(key in SETTINGS_KEYS)) return;
+        localStorage.setItem(SETTINGS_KEYS[key], String(!!value));
+    }
+
+    // ====== ЗАПРОС JSON ======
+    function fetchJSON(url, callback) {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.timeout = CONFIG.TIMEOUT;
+        xhr.setRequestHeader('Accept', 'application/json');
+
+        xhr.onload = function() {
+            if (xhr.status !== 200) {
+                callback(null);
+                return;
+            }
+            try {
+                callback(JSON.parse(xhr.responseText));
+            } catch (e) {
+                console.error('Ошибка парсинга ответа ' + url + ':', e);
+                callback(null);
+            }
+        };
+        xhr.onerror = function() {
+            console.error('Ошибка сети (' + url + ')');
+            callback(null);
+        };
+        xhr.ontimeout = function() {
+            console.error('Таймаут (' + url + ')');
+            callback(null);
+        };
+
+        xhr.send();
+    }
+
+    // ====== ПРОВЕРКА СЕССИИ ======
+    function isSessionActive() {
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            cookie = cookie.trim();
+            if (cookie.startsWith('sessionid=') ||
+                cookie.startsWith('SessionID=') ||
+                cookie.startsWith('CGISESSID=')) {
+                return true;
+            }
+        }
+
+        if (window.storedSid || window.sessionInstance) {
+            return true;
+        }
+
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.has('sid') || urlParams.has('sessionid') || urlParams.has('SessionID')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ====== КОНФИГ ИЗ DATA.APP (client.panel) ======
+    // Валидируем всё до первого присвоения: конфиг применяется атомарно,
+    // битая секция -> false -> панель не работает вовсе.
+    function applyClientConfig(section) {
+        if (!section || typeof section !== 'object') return false;
+
+        const strings = {
+            SERVICES_URL: section.services_url,
+            DATE_SITE: section.date_site,
+            DATE_URL: section.date_url,
+        };
+        for (let key in strings) {
+            const value = strings[key];
+            if (typeof value !== 'string' || !value) return false;
+        }
+        if (!/^https?:\/\//.test(strings.DATE_SITE)) return false;
+        if (strings.DATE_URL.charAt(0) !== '/' || strings.SERVICES_URL.charAt(0) !== '/') return false;
+
+        const ints = {
+            TIMEOUT:                [section.timeout_ms,               1000,   30000],
+            SESSION_POLL_INTERVAL:  [section.session_poll_interval_ms, 1000,   60000],
+            TIME_REFRESH_INTERVAL:  [section.time_refresh_interval_ms, 30000,  3600000],
+            SERVICES_RETRY_DELAY:   [section.services_retry_delay_ms,  5000,   600000],
+            SERVICES_HIDE_DELAY:    [section.services_hide_delay_ms,   0,      2000],
+            MOBILE_BREAKPOINT:      [section.mobile_breakpoint_px,     320,    1600],
+        };
+        for (let key in ints) {
+            const value = ints[key][0], lo = ints[key][1], hi = ints[key][2];
+            if (typeof value !== 'number' || !isFinite(value) || value < lo || value > hi) return false;
+        }
+
+        for (let key in strings) CONFIG[key] = strings[key];
+        for (let key in ints) CONFIG[key] = ints[key][0];
+        return true;
+    }
+
+    // ====== ПАРИТЕТ И ВРЕМЯ (date.app) ======
+    // Один ответ даёт и паритет, и время: паритет кэшируется на бэкенде,
+    // время ходит на апстрим всегда. Битое значение -> бейдж тихо скрыт /
+    // остаётся прежнее смещение (или локальное время).
+    function refreshDateTime() {
+        fetchJSON(CONFIG.DATE_URL, function(data) {
+            if (!data || typeof data !== 'object') return;
+
+            parityMode = (typeof data.mode === 'string' && PARITY_WHITELIST.indexOf(data.mode) >= 0)
+                ? data.mode
+                : null;
+
+            if (typeof data.epoch_ms === 'number' && isFinite(data.epoch_ms)) {
+                timeOffsetMs = data.epoch_ms - Date.now();
+            }
+
+            updateDateRow();
+        });
+    }
+
+    function serverNow() {
+        return timeOffsetMs === null ? new Date() : new Date(Date.now() + timeOffsetMs);
+    }
+
+    // ====== ФОРМАТИРОВАНИЕ ======
+    function formatDate(d) {
+        return d.toLocaleDateString('ru-RU', { year: 'numeric', month: 'long', day: 'numeric' });
+    }
+
+    function formatTime(d) {
+        function pad(n) { return String(n).padStart(2, '0'); }
+        return pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    // ====== ПРИМЕНЕНИЕ НАСТРОЕК ======
+    function applySettings() {
+        const s = getPanelSettings();
+        const popup = document.getElementById('date-popup');
+        if (!popup) return;
+
+        popup.classList.toggle('panel-disabled', !s.enabled);
+        if (!s.enabled) popup.classList.remove('services-open');
+
+        const badge = popup.querySelector('.parity-badge');
+        const sep = popup.querySelector('.parity-sep');
+        if (badge && sep) {
+            if (s.showParity) {
+                const hasMode = !!parityMode;
+                badge.textContent = hasMode ? parityMode : '—';
+                badge.classList.toggle('placeholder', !hasMode);
+                badge.style.display = '';
+                sep.style.display = '';
+            } else {
+                badge.style.display = 'none';
+                sep.style.display = 'none';
+            }
+        }
+
+        const wrap = popup.querySelector('.services-wrap');
+        if (wrap) wrap.style.display = s.showServices ? '' : 'none';
+
+        const indicator = popup.querySelector('.expand-indicator');
+        if (indicator) indicator.style.display = (s.enabled && s.showServices) ? '' : 'none';
+    }
+
+    // ====== МОДАЛКА НАСТРОЕК ======
+    function openSettingsModal() {
+        if (document.getElementById('panel-settings-modal')) return;
+        const s = getPanelSettings();
+
+        const backdrop = document.createElement('div');
+        backdrop.id = 'panel-settings-modal';
+
+        const box = document.createElement('div');
+        box.className = 'settings-modal-box';
+
+        const title = document.createElement('h3');
+        title.className = 'settings-modal-title';
+        title.textContent = 'Настройки панели';
+        box.appendChild(title);
+
+        [
+            { key: 'enabled',      label: 'Показывать панель' },
+            { key: 'showParity',   label: 'Показывать числитель/знаменатель' },
+            { key: 'showServices', label: 'Показывать сервисы' },
+        ].forEach(function(item) {
+            const label = document.createElement('label');
+            label.className = 'settings-modal-label';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = s[item.key];
+            input.addEventListener('change', function() {
+                setPanelSettings(item.key, input.checked);
+            });
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(' ' + item.label));
+            box.appendChild(label);
+        });
+
+        const note = document.createElement('p');
+        note.className = 'settings-modal-note';
+        note.textContent = 'Изменения применятся при следующем входе в систему или при обновлении страницы.';
+        box.appendChild(note);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'settings-modal-close';
+        closeBtn.textContent = 'Закрыть';
+        closeBtn.addEventListener('click', closeSettingsModal);
+        box.appendChild(closeBtn);
+
+        backdrop.appendChild(box);
+        backdrop.addEventListener('click', function(e) {
+            if (e.target === backdrop) closeSettingsModal();
+        });
+        document.body.appendChild(backdrop);
+    }
+
+    function closeSettingsModal() {
+        const m = document.getElementById('panel-settings-modal');
+        if (m) m.remove();
+    }
+
+    // ====== ПОПАП (#date-popup) ======
+    function ensurePopup() {
+        let popup = document.getElementById('date-popup');
+        if (popup) return popup;
+
+        const s = getPanelSettings();
+
+        popup = document.createElement('div');
+        popup.id = 'date-popup';
+
+        const settingsBtn = document.createElement('button');
+        settingsBtn.type = 'button';
+        settingsBtn.className = 'panel-settings-btn';
+        settingsBtn.textContent = '\u2699';
+        settingsBtn.setAttribute('aria-label', 'Настройки панели');
+        settingsBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            openSettingsModal();
+        });
+
+        if (s.enabled) {
+            const row = document.createElement('div');
+            row.className = 'date-row';
+
+            const icon = document.createElement('span');
+            icon.className = 'date-icon';
+            icon.textContent = '📅';
+
+            const dateText = document.createElement('span');
+            dateText.className = 'date-text';
+
+            const sepMid = document.createElement('span');
+            sepMid.className = 'date-sep';
+            sepMid.textContent = '·';
+
+            const badge = document.createElement('span');
+            badge.className = 'parity-badge';
+
+            const sepBadge = document.createElement('span');
+            sepBadge.className = 'date-sep parity-sep';
+            sepBadge.textContent = '·';
+
+            const timeText = document.createElement('span');
+            timeText.className = 'time-text';
+
+            const indicator = document.createElement('span');
+            indicator.className = 'expand-indicator';
+
+            row.appendChild(icon);
+            row.appendChild(dateText);
+            row.appendChild(sepMid);
+            row.appendChild(badge);
+            row.appendChild(sepBadge);
+            row.appendChild(timeText);
+            row.appendChild(indicator);
+            row.appendChild(settingsBtn);
+
+            const wrap = document.createElement('div');
+            wrap.className = 'services-wrap';
+            const grid = document.createElement('div');
+            grid.className = 'services-grid';
+            wrap.appendChild(grid);
+
+            popup.appendChild(row);
+            popup.appendChild(wrap);
+
+            row.addEventListener('click', function() {
+                if (isMobileView()) {
+                    if (interactive) {
+                        openOverlay();
+                    } else {
+                        window.location.href = CONFIG.DATE_SITE;
+                    }
+                } else {
+                    window.location.href = CONFIG.DATE_SITE;
+                }
+            });
+        } else {
+            popup.appendChild(settingsBtn);
+        }
+
+        document.body.appendChild(popup);
+        updateDateRow();
+        applyPopupWidth();
+        return popup;
+    }
+
+    // Ширина collapsed задаётся фиксированными классами (width-max/med/min)
+    // один раз на старте по настройкам, без привязки к содержимому, чтобы
+    // попап не "расползался". В открытом состоянии (services-open) ширину
+    // держит CSS через !important.
+    function applyPopupWidth() {
+        const popup = document.getElementById('date-popup');
+        if (!popup || popup.classList.contains('services-open')) return;
+        const s = getPanelSettings();
+        popup.classList.remove('width-max', 'width-med', 'width-min');
+        if (!s.enabled)        popup.classList.add('width-min');
+        else if (s.showParity) popup.classList.add('width-max');
+        else                   popup.classList.add('width-med');
+    }
+
+    // Обновляет дату/бейдж/время в попапе и в открытом оверлее.
+    // Тикает раз в секунду (ловит и смену суток).
+    function updateDateRow() {
+        const now = serverNow();
+        const dateStr = formatDate(now);
+        const timeStr = formatTime(now);
+
+        const dateText = document.querySelector('#date-popup .date-text');
+        if (dateText) dateText.textContent = dateStr;
+
+        const badge = document.querySelector('#date-popup .parity-badge');
+        const sep = document.querySelector('#date-popup .parity-sep');
+        const s = getPanelSettings();
+        if (badge && sep) {
+            if (s.showParity) {
+                const hasMode = !!parityMode;
+                badge.textContent = hasMode ? parityMode : '—';
+                badge.classList.toggle('placeholder', !hasMode);
+                badge.style.display = '';
+                sep.style.display = '';
+            } else {
+                badge.style.display = 'none';
+                sep.style.display = 'none';
+            }
+        }
+
+        const timeText = document.querySelector('#date-popup .time-text');
+        if (timeText) timeText.textContent = timeStr;
+
+        const overlayLine = document.getElementById('overlay-date-line');
+        if (overlayLine) {
+            const s = getPanelSettings();
+            const parityPart = s.showParity ? ' · ' + (parityMode || '—') : '';
+            overlayLine.textContent = '📅 ' + dateStr + parityPart + ' · ' + timeStr;
+        }
+    }
+
+    // ====== МОБИЛЬНЫЙ ВИД ======
+    function isMobileView() {
+        const coarse = window.matchMedia
+            ? window.matchMedia('(pointer: coarse)').matches
+            : false;
+        return window.innerWidth < CONFIG.MOBILE_BREAKPOINT || coarse === true;
+    }
+
+    // ====== ЗАГРУЗКА СЕРВИСОВ ======
+    // Строгая валидация ответа services.app: битые записи отбрасываются,
+    // пустой/невалидный список -> null (панель не показывается)
+    function validateServicesResponse(response) {
+        if (!response || typeof response !== 'object') return null;
+        if (response.enable !== true) return null;
+        if (!Array.isArray(response.services)) return null;
+
+        const items = [];
+        for (let entry of response.services) {
+            if (!entry || typeof entry !== 'object') continue;
+
+            const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+            const urlStr = typeof entry.url === 'string' ? entry.url.trim() : '';
+            if (!name || !urlStr) continue;
+
+            try {
+                const url = new URL(urlStr);
+                if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+
+                items.push({
+                    name: name,
+                    description: typeof entry.description === 'string' ? entry.description.trim() : '',
+                    url: url.href,
+                    internal: entry.internal === true
+                });
+            } catch (e) {
+                // невалидный URL — запись пропускается
+            }
+        }
+        return items.length ? items : null;
+    }
+
+    function fetchServices(callback) {
+        fetchJSON(CONFIG.SERVICES_URL, function(raw) {
+            callback(validateServicesResponse(raw));
+        });
+    }
+
+    // Ленивая загрузка с retry-гвардией: после неудачи повтор не раньше
+    // чем через SERVICES_RETRY_DELAY. onReady вызывается только при успехе.
+    function loadServices(onReady) {
+        if (servicesItems) {
+            fillAllGrids();
+            if (onReady) onReady(true);
+            return;
+        }
+        if (servicesFetching) return;
+
+        const now = Date.now();
+        if (servicesFetchFailedAt && (now - servicesFetchFailedAt) < CONFIG.SERVICES_RETRY_DELAY) return;
+
+        servicesFetching = true;
+        fetchServices(function(items) {
+            servicesFetching = false;
+            if (items === null) {
+                servicesFetchFailedAt = Date.now();
+                return;
+            }
+            servicesItems = items;
+            fillAllGrids();
+            if (onReady) onReady(true);
+        });
+    }
+
+    // Рендер только через безопасный DOM: textContent, проверенные URL
+    function buildServiceItem(item) {
+        // internal-сервис при внешнем клиенте: бледная плитка без ссылки,
+        // клик открывает объясняющую модалку
+        if (item.internal && !clientInternal) {
+            const tile = document.createElement('span');
+            tile.className = 'service-item service-internal';
+            tile.setAttribute('aria-disabled', 'true');
+
+            const name = document.createElement('span');
+            name.className = 'service-name';
+            name.textContent = item.name;
+            tile.appendChild(name);
+
+            if (item.description) {
+                const desc = document.createElement('span');
+                desc.className = 'service-desc';
+                desc.textContent = item.description;
+                tile.appendChild(desc);
+            }
+
+            tile.addEventListener('click', function() {
+                openInternalModal();
+            });
+            return tile;
+        }
+
+        const link = document.createElement('a');
+        link.className = 'service-item';
+        link.href = item.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+
+        const name = document.createElement('span');
+        name.className = 'service-name';
+        name.textContent = item.name;
+        link.appendChild(name);
+
+        if (item.description) {
+            const desc = document.createElement('span');
+            desc.className = 'service-desc';
+            desc.textContent = item.description;
+            link.appendChild(desc);
+        }
+
+        return link;
+    }
+
+    // Наполняет конкретную сетку один раз
+    function fillGrid(grid) {
+        if (!grid || grid.dataset.filled || !servicesItems) return;
+        grid.dataset.filled = '1';
+        servicesItems.forEach(function(item) {
+            grid.appendChild(buildServiceItem(item));
+        });
+    }
+
+    // Данные пришли позже, чем сетка появилась, — наполняем все существующие
+    function fillAllGrids() {
+        if (!servicesItems) return;
+        const grids = document.querySelectorAll('.services-grid');
+        for (let i = 0; i < grids.length; i++) {
+            fillGrid(grids[i]);
+        }
+    }
+
+    // ====== ХОВЕР-РАЗВОРОТ (ДЕСКТОП, ТОЛЬКО СЕССИЯ) ======
+    function expandServices(popup) {
+        fillAllGrids();
+        popup.classList.add('services-open');
+    }
+
+    function setupServicesPanel() {
+        if (servicesPanelInitialized) return;
+
+        const popup = document.getElementById('date-popup');
+        if (!popup) return;
+
+        servicesPanelInitialized = true;
+
+        popup.addEventListener('mouseenter', function() {
+            clearTimeout(servicesHideTimer);
+
+            if (servicesItems) {
+                expandServices(popup);
+                return;
+            }
+            loadServices(function() {
+                // раскрываем, только если курсор всё ещё на попапе
+                if (popup.matches(':hover')) expandServices(popup);
+            });
+        });
+
+        popup.addEventListener('mouseleave', function() {
+            servicesHideTimer = setTimeout(function() {
+                popup.classList.remove('services-open');
+            }, CONFIG.SERVICES_HIDE_DELAY);
+        });
+    }
+
+    // ====== МОДАЛКА "ТОЛЬКО ИЗ СЕТИ ВУЗА" ======
+    function openInternalModal() {
+        if (document.getElementById('internal-modal')) return;
+
+        const backdrop = document.createElement('div');
+        backdrop.id = 'internal-modal';
+
+        const box = document.createElement('div');
+        box.className = 'internal-modal-box';
+
+        const text = document.createElement('p');
+        text.className = 'internal-modal-text';
+        text.textContent = 'Этот сервис доступен только из сети университета. Подключитесь к сети вуза или VPN.';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'internal-modal-btn';
+        btn.textContent = 'Понятно';
+        btn.addEventListener('click', closeInternalModal);
+
+        box.appendChild(text);
+        box.appendChild(btn);
+        backdrop.appendChild(box);
+
+        backdrop.addEventListener('click', function(e) {
+            if (e.target === backdrop) closeInternalModal();
+        });
+
+        document.body.appendChild(backdrop);
+    }
+
+    function closeInternalModal() {
+        const modal = document.getElementById('internal-modal');
+        if (modal) modal.remove();
+    }
+
+    // ====== МОБИЛЬНЫЙ ФУЛСКРИН-ОВЕРЛЕЙ ======
+    function openOverlay() {
+        if (document.getElementById('services-overlay')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'services-overlay';
+
+        const header = document.createElement('div');
+        header.className = 'overlay-header';
+
+        const title = document.createElement('div');
+        title.className = 'overlay-title';
+        title.textContent = 'Сервисы';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'overlay-close';
+        closeBtn.setAttribute('aria-label', 'Закрыть');
+        closeBtn.textContent = '✕';
+        closeBtn.addEventListener('click', closeOverlay);
+
+        header.appendChild(title);
+        header.appendChild(closeBtn);
+
+        const dateLine = document.createElement('div');
+        dateLine.id = 'overlay-date-line';
+        dateLine.className = 'overlay-date';
+
+        const siteLink = document.createElement('a');
+        siteLink.className = 'overlay-site-link';
+        siteLink.href = CONFIG.DATE_SITE;
+        siteLink.target = '_blank';
+        siteLink.rel = 'noopener';
+        siteLink.textContent = 'Открыть date.cchgeu.ru';
+
+        const wrap = document.createElement('div');
+        wrap.className = 'services-wrap';
+        const grid = document.createElement('div');
+        grid.className = 'services-grid';
+        wrap.appendChild(grid);
+
+        overlay.appendChild(header);
+        overlay.appendChild(dateLine);
+        overlay.appendChild(siteLink);
+        overlay.appendChild(wrap);
+
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) closeOverlay();
+        });
+
+        document.body.appendChild(overlay);
+        // блокируем скролл страницы, пока оверлей открыт
+        document.body.style.overflow = 'hidden';
+
+        updateDateRow();
+        loadServices(null);
+    }
+
+    function closeOverlay() {
+        const overlay = document.getElementById('services-overlay');
+        if (overlay) overlay.remove();
+        document.body.style.overflow = '';
+    }
+
+    function handleEscape(e) {
+        if (e.key !== 'Escape') return;
+        if (document.getElementById('panel-settings-modal')) { closeSettingsModal(); return; }
+        if (document.getElementById('internal-modal'))        { closeInternalModal(); return; }
+        if (document.getElementById('services-overlay'))      { closeOverlay(); return; }
+    }
+
+    // ====== ИНТЕРАКТИВНЫЙ РЕЖИМ (СЕССИЯ АКТИВНА) ======
+    function activateInteractive() {
+        stopSessionPolling();
+        interactive = true;
+
+        ensurePopup();
+        const popup = document.getElementById('date-popup');
+        if (popup) {
+            popup.classList.add('interactive');
+            updateDateRow();
+            applyPopupWidth();
+            applySettings();
+            const s = getPanelSettings();
+            if (s.enabled && s.showServices) setupServicesPanel();
+        }
+    }
+
+    // Ожидание логина: опрашиваем сессию, при появлении апгрейдим карточку
+    function startSessionPolling() {
+        if (sessionPollTimer || interactive) return;
+        sessionPollTimer = setInterval(function() {
+            if (isSessionActive()) {
+                activateInteractive();
+            }
+        }, CONFIG.SESSION_POLL_INTERVAL);
+    }
+
+    function stopSessionPolling() {
+        if (sessionPollTimer) {
+            clearInterval(sessionPollTimer);
+            sessionPollTimer = null;
+        }
+    }
+
+    // ====== ЗАПУСК ======
+    function init() {
+        injectPanelStyles();
+        patchPopupWrapper();
+        document.addEventListener('keydown', handleEscape);
+
+        // Единая точка старта: из data.app приходят enable, internal и конфиг.
+        // Нет валидного ответа или секции client.panel -> панель не работает.
+        fetchJSON(CONFIG.DATA_URL, function(response) {
+            if (!response || typeof response !== 'object' || response.enable !== true) return;
+            if (!applyClientConfig(response.client && response.client.panel)) return;
+
+            clientInternal = response.internal === true;
+
+            if (isSessionActive()) {
+                activateInteractive();
+            } else {
+                ensurePopup();
+                startSessionPolling();
+            }
+            applySettings();
+
+            refreshDateTime();
+            setInterval(updateDateRow, 60000);
+            setInterval(refreshDateTime, CONFIG.TIME_REFRESH_INTERVAL);
+        });
+    }
+
+    // ====== СТИЛИ ======
+    function injectPanelStyles() {
+        if (document.getElementById('cgp-panel-style')) return;
+
+        const style = document.createElement('style');
+        style.id = 'cgp-panel-style';
+        style.textContent = `
+            #date-popup {
+                position: fixed;
+                bottom: -5px;
+                right: 44px;
+                background: #374349;
+                color: #ffffff;
+                padding: 10px 16px;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+                font-family: Arial, sans-serif;
+                font-size: 14px;
+                z-index: 9999;
+                pointer-events: auto;
+                cursor: default;
+                box-sizing: border-box;
+                overflow: hidden;
+                width: 260px;
+                transition: width 0.25s ease;
+            }
+            #date-popup.width-max { width: 390px; }
+            #date-popup.width-med  { width: 260px; }
+            #date-popup.width-min  { width: 48px; }
+            #date-popup .parity-badge.placeholder { opacity: 0.45; }
+            #date-popup .date-row {
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+                gap: 6px;
+                white-space: nowrap;
+                cursor: pointer;
+            }
+            #date-popup .date-sep { color: rgba(255,255,255,0.45); }
+            #date-popup .parity-badge {
+                padding: 1px 8px;
+                border-radius: 10px;
+                background: rgba(255,255,255,0.12);
+                font-size: 12px;
+                white-space: nowrap;
+            }
+            #date-popup .time-text { font-variant-numeric: tabular-nums; }
+            #date-popup .expand-indicator {
+                display: none;
+                flex: 0 0 auto;
+                width: 7px;
+                height: 7px;
+                margin-left: 2px;
+                border-right: 2px solid rgba(255,255,255,0.7);
+                border-bottom: 2px solid rgba(255,255,255,0.7);
+                transform: rotate(45deg) translateY(-2px);
+                transition: transform 0.25s ease;
+            }
+            #date-popup.interactive .expand-indicator { display: inline-block; }
+            #date-popup.services-open { width: 560px !important; max-width: calc(100vw - 60px); }
+            #date-popup.services-open .expand-indicator { transform: rotate(225deg) translateY(-2px); }
+            #date-popup.services-open .date-row {
+                border-bottom: 1px solid rgba(255,255,255,0.12);
+                padding-bottom: 8px;
+                margin-bottom: 10px;
+            }
+            #date-popup .services-wrap {
+                max-height: 0;
+                opacity: 0;
+                overflow: hidden;
+                transition: max-height 0.25s ease, opacity 0.2s ease;
+            }
+            #date-popup.services-open .services-wrap {
+                max-height: 480px;
+                opacity: 1;
+            }
+            #date-popup .services-grid {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 8px;
+            }
+            @media (max-width: 560px) {
+                #date-popup .services-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            }
+            @media (max-width: 380px) {
+                #date-popup .services-grid { grid-template-columns: minmax(0, 1fr); }
+            }
+            #date-popup .service-item, #services-overlay .service-item {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                padding: 8px 10px;
+                border-radius: 6px;
+                background: rgba(255,255,255,0.10);
+                color: #ffffff;
+                text-decoration: none;
+                transition: background 0.15s ease;
+            }
+            #date-popup a.service-item:hover, #services-overlay a.service-item:hover {
+                background: rgba(255,255,255,0.16);
+            }
+            #date-popup .service-item.service-internal, #services-overlay .service-item.service-internal {
+                opacity: 0.55;
+                background: rgba(255,255,255,0.03);
+                cursor: default;
+            }
+            #date-popup .service-name, #services-overlay .service-name {
+                font-size: 13px;
+                font-weight: bold;
+                line-height: 1.25;
+            }
+            #date-popup .service-desc, #services-overlay .service-desc {
+                font-size: 11px;
+                color: #b8c2d0;
+                line-height: 1.3;
+            }
+            #services-overlay {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                background: #263145;
+                color: #ffffff;
+                font-family: Arial, sans-serif;
+                font-size: 14px;
+                z-index: 10000;
+                overflow-y: auto;
+                padding: 20px 16px 40px;
+                box-sizing: border-box;
+            }
+            #services-overlay .overlay-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 16px;
+            }
+            #services-overlay .overlay-title {
+                font-size: 22px;
+                font-weight: bold;
+            }
+            #services-overlay .overlay-close {
+                background: none;
+                border: none;
+                color: #ffffff;
+                font-size: 26px;
+                line-height: 1;
+                padding: 6px 10px;
+                cursor: pointer;
+            }
+            #services-overlay .overlay-date {
+                font-size: 18px;
+                margin-bottom: 14px;
+                color: #dfe6ef;
+            }
+            #services-overlay .overlay-site-link {
+                display: block;
+                margin-bottom: 18px;
+                color: #9fc1ff;
+                font-size: 15px;
+                text-decoration: none;
+            }
+            #services-overlay .overlay-site-link:hover { text-decoration: underline; }
+            #services-overlay .services-wrap { max-height: none; opacity: 1; overflow: visible; }
+            #services-overlay .services-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                gap: 8px;
+            }
+            #internal-modal {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                background: rgba(0,0,0,0.55);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10001;
+                padding: 24px;
+                box-sizing: border-box;
+                font-family: Arial, sans-serif;
+            }
+            #internal-modal .internal-modal-box {
+                background: #ffffff;
+                color: #263145;
+                border-radius: 8px;
+                max-width: 360px;
+                width: 100%;
+                padding: 20px 22px;
+                box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+                box-sizing: border-box;
+            }
+            #internal-modal .internal-modal-text {
+                margin: 0 0 16px;
+                font-size: 14px;
+                line-height: 1.5;
+            }
+            #internal-modal .internal-modal-btn {
+                background: #263145;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 9px 26px;
+                font-size: 14px;
+                cursor: pointer;
+            }
+
+            .panel-settings-btn {
+                background: none;
+                border: none;
+                color: rgba(255,255,255,0.6);
+                font-size: 16px;
+                cursor: pointer;
+                padding: 2px 4px;
+                line-height: 1;
+                transition: color 0.15s ease;
+                flex: 0 0 auto;
+            }
+            .panel-settings-btn:hover {
+                color: #ffffff;
+            }
+            #date-popup.panel-disabled {
+                padding: 6px 10px;
+                width: auto !important;
+            }
+            #date-popup.panel-disabled .date-row,
+            #date-popup.panel-disabled .services-wrap {
+                display: none !important;
+            }
+            #panel-settings-modal {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                background: rgba(0,0,0,0.55);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10001;
+                padding: 24px;
+                box-sizing: border-box;
+                font-family: Arial, sans-serif;
+            }
+            .settings-modal-box {
+                background: #ffffff;
+                color: #263145;
+                border-radius: 8px;
+                max-width: 380px;
+                width: 100%;
+                padding: 22px 24px;
+                box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+                box-sizing: border-box;
+            }
+            .settings-modal-title {
+                margin: 0 0 16px;
+                font-size: 17px;
+                font-weight: bold;
+            }
+            .settings-modal-label {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 0;
+                font-size: 14px;
+                cursor: pointer;
+            }
+            .settings-modal-label input[type="checkbox"] {
+                width: 16px;
+                height: 16px;
+                accent-color: #263145;
+            }
+            .settings-modal-close {
+                display: block;
+                width: 100%;
+                margin-top: 18px;
+                background: #263145;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 0;
+                font-size: 14px;
+                cursor: pointer;
+            }
+            .settings-modal-note {
+                margin: 14px 0 0;
+                font-size: 12px;
+                color: #666;
+                text-align: center;
+                line-height: 1.4;
+            }
+            .mailfix {
+                right: 420px !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ====== ФИКС ПОПАПА КОМПОЗЕРА (Samoware) ======
+    // При сворачивании письма в редакторе popup-обёртка compose попадает
+    // позади панели. Samoware перезаписывает `right` своего селектора,
+    // поэтому добавляем свой класс `mailfix` один раз через MutationObserver.
+    function patchPopupWrapper() {
+        const selector = '.samoware-front-popups__wrapper.samoware-front-popups__wrapper-right-spacing-1';
+        const apply = function() {
+            const el = document.querySelector(selector);
+            if (el) el.classList.add('mailfix');
+            return !!el;
+        };
+        if (apply()) return;
+        const obs = new MutationObserver(function() {
+            if (apply()) obs.disconnect();
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+})();

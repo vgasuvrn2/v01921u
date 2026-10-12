@@ -1,0 +1,967 @@
+// ====== АВТОРИЗАЦИОННЫЙ КОНТУР СТРАНИЦЫ ЛОГИНА ======
+// Попап даты и панель сервисов вынесены в panel.js (независимый скрипт).
+(function() {
+    'use strict';
+
+    // ====== КОНФИГУРАЦИЯ ======
+    // Единственная константа — точка входа (+ таймаут самого этого запроса).
+    // Всё остальное (URL'ы и тайминги) приходит из data.app: секция client.acc
+    // собирается на сервере из data.json. Без валидной секции скрипт молчит.
+    const CONFIG = {
+        IP_CHECK_URL: '/cgi-bin/data.app',
+        TIMEOUT: 5000,
+    };
+
+    // We store user data for login
+    let pendingLoginData = null;
+    let pendingToken = null;
+    let pendingMessages = null;
+    let pendingClientConfig = null;
+    let autoLoginTimer = null;
+    let progressTimer = null;
+
+    // Ключи сообщений, которые обязаны приходить в ответе data.app
+    const REQUIRED_MESSAGE_KEYS = ['expires', 'password_expired', 'invalid', 'error', 'token'];
+    // Ключи строк сообщения, каждая показывается с новой строки
+    const MESSAGE_LINE_KEYS = ['line1', 'line2', 'line3'];
+
+    // ====== ЭКРАНИРОВАНИЕ ДЛЯ HTML ======
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // ====== ВАЛИДАЦИЯ ОТВЕТА DATA.APP ======
+    // Активация только если токен и все сообщения на месте.
+    function isValidMessage(msg) {
+        if (!msg || typeof msg !== 'object') return false;
+        return MESSAGE_LINE_KEYS.some(function(key) {
+            return typeof msg[key] === 'string' && msg[key].trim();
+        });
+    }
+
+    function validateCheckResponse(response) {
+        if (!response || typeof response !== 'object') return false;
+        if (typeof response.token !== 'string' || !response.token) return false;
+
+        const messages = response.messages;
+        if (!messages || typeof messages !== 'object') return false;
+
+        for (let key of REQUIRED_MESSAGE_KEYS) {
+            if (!isValidMessage(messages[key])) {
+                console.error('❌ В data.app отсутствует или некорректно сообщение:', key);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ====== ПОЛУЧЕНИЕ СООБЩЕНИЯ ИЗ КОНФИГУРАЦИИ ======
+    function getMessage(key) {
+        if (!pendingMessages) return null;
+        const msg = pendingMessages[key];
+        if (!isValidMessage(msg)) return null;
+        return msg;
+    }
+
+    // ====== БЕЗОПАСНАЯ СБОРКА СООБЩЕНИЯ ======
+    // line1..line3 с новой строки ({days} подставляется), только textContent.
+    function buildMessageElement(msg, daysLeft) {
+        if (!isValidMessage(msg)) return null;
+
+        const days = parseInt(daysLeft, 10);
+        const hasDays = !isNaN(days);
+        const fragment = document.createDocumentFragment();
+
+        MESSAGE_LINE_KEYS.forEach(function(key) {
+            const value = msg[key];
+            if (typeof value !== 'string' || !value.trim()) return;
+
+            let text = value;
+            if (hasDays) {
+                text = text.replace(/\{days\}/g, String(days));
+            }
+
+            const line = document.createElement('span');
+            line.style.display = 'block';
+            if (key === 'line1') {
+                line.style.fontWeight = 'bold';
+                line.style.padding = '1rem 0';
+            }
+            line.textContent = text;
+            fragment.appendChild(line);
+        });
+
+        if (msg.link_url && msg.link_text) {
+            try {
+                const url = new URL(msg.link_url);
+                if (url.protocol === 'https:' || url.protocol === 'http:') {
+                    const link = document.createElement('a');
+                    link.href = url.href;
+                    link.textContent = String(msg.link_text);
+                    link.target = '_blank';
+                    link.rel = 'noopener';
+                    link.style.cssText = 'color: inherit; text-decoration: underline;';
+                    fragment.appendChild(link);
+                }
+            } catch (e) {
+                // невалидный URL — показываем только текст
+            }
+        }
+
+        return fragment;
+    }
+
+    // ====== ПРОВЕРКА СЕССИИ ======
+    function isSessionActive() {
+        const cookies = document.cookie.split(';');
+        for (let cookie of cookies) {
+            cookie = cookie.trim();
+            if (cookie.startsWith('sessionid=') || 
+                cookie.startsWith('SessionID=') ||
+                cookie.startsWith('CGISESSID=')) {
+                return true;
+            }
+        }
+        
+        if (window.storedSid || window.sessionInstance) {
+            return true;
+        }
+        
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.has('sid') || urlParams.has('sessionid') || urlParams.has('SessionID')) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    // ====== ПОИСК ПОЛЕЙ ВВОДА ======
+    function getLoginFields() {
+        let usernameField = window.o;
+        let passwordField = window.p;
+        
+        if (!usernameField || !passwordField || typeof usernameField.val !== 'function') {
+            usernameField = $('.samoware-login__login');
+            passwordField = $('.samoware-login__password');
+        }
+        
+        if (!usernameField || !usernameField.length) {
+            usernameField = $('input[name="username"], input[name="login"], input[type="text"][class*="login"]');
+            passwordField = $('input[name="password"], input[type="password"]');
+        }
+        
+        return {
+            username: usernameField,
+            password: passwordField
+        };
+    }
+
+    // ====== ПОЛУЧЕНИЕ EMAIL ПОЛЬЗОВАТЕЛЯ ======
+    function getUserEmail() {
+        // Пробуем получить из поля ввода
+        const fields = getLoginFields();
+        let email = '';
+        
+        if (fields.username && typeof fields.username.val === 'function') {
+            email = fields.username.val() || '';
+        }
+        
+        if (!email && window.o && typeof window.o.val === 'function') {
+            email = window.o.val() || '';
+        }
+        
+        if (!email) {
+            const usernameInput = document.querySelector('.samoware-login__login') || 
+                                 document.querySelector('input[name="username"]');
+            if (usernameInput) email = usernameInput.value || '';
+        }
+        
+        // Добавляем домен если нужно
+        if (window.n && email.indexOf('@') < 0 && email) {
+            const domain = $('#samoware-login__domain-selector').val();
+            if (domain) {
+                email += '@' + domain;
+            }
+        }
+        
+        return email;
+    }
+
+    // ====== СОЗДАНИЕ ИНФОРМАЦИОННОЙ ПАНЕЛИ ======
+    function showUserInfoPanel(data) {
+        // Скрываем спиннер
+        $('.samoware-login__siginingin').hide();
+        
+        // Находим контейнер логина
+        const loginContainer = document.getElementById('samoware-login__start');
+        if (!loginContainer) {
+            console.error('❌ Контейнер samoware-login__start не найден');
+            return;
+        }
+
+        // Сохраняем данные для логина
+        pendingLoginData = data;
+
+        // Получаем email пользователя
+        const userEmail = getUserEmail() || data.username || '';
+
+        // Получаем данные пользователя
+        const displayName = data.display_name || '';
+        const status = data.status || 'ok';
+        const daysLeft = data.days_left || 0;
+
+        // Задержка автологина: истекающему паролю — побольше, чтобы
+        // успеть прочитать предупреждение и сменить пароль
+        const autoLoginDelay = status === 'expires'
+            ? CONFIG.AUTO_LOGIN_DELAY_EXPIRES
+            : CONFIG.AUTO_LOGIN_DELAY_OK;
+
+        // Выбираем ключ сообщения и цветовую схему по статусу:
+        // expires — пароль истекает, password_expired — уже истек
+        let messageKey = null;
+        let statusColor = '#856404';
+        let statusBg = '#fff3cd';
+        let statusBorder = '#ffeeba';
+
+        if (status === 'expires' && daysLeft > 0) {
+            messageKey = 'expires';
+        } else if (status === 'password_expired') {
+            messageKey = 'password_expired';
+            statusColor = '#721c24';
+            statusBg = '#f8d7da';
+            statusBorder = '#f5c6cb';
+        }
+
+        // Скрываем форму
+        loginContainer.style.display = 'none';
+        
+        // Проверяем, нет ли уже нашей панели
+        let panel = document.getElementById('custom-login-panel');
+        if (panel) {
+            panel.remove();
+        }
+
+        // Создаем панель
+        panel = document.createElement('div');
+        panel.id = 'custom-login-panel';
+        panel.style.cssText = `
+            animation: fadeInUp 0.5s ease;
+            margin-top: 40px;
+            width: 340px;
+            margin-left: auto;
+            margin-right: auto;
+            position: relative;
+            z-index: 10;
+        `;
+
+        let html = `
+            <!-- Приветствие -->
+            <div style="
+                text-align: center;
+                margin-bottom: 20px;
+            ">
+                <h2 style="
+                    color: #263145;
+                    font-size: 22px;
+                    font-weight: 500;
+                    margin: 0 0 4px 0;
+                    font-family: Arial, sans-serif;
+                ">
+                    Добро пожаловать${displayName ? ', ' + escapeHtml(displayName) : ''}
+                </h2>
+                <p style="
+                    color: #5f6368;
+                    font-size: 14px;
+                    margin: 0;
+                    font-family: Arial, sans-serif;
+                ">
+                    ${escapeHtml(userEmail)}
+                </p>
+            </div>
+        `;
+
+        // Добавляем предупреждение о пароле только если есть что показать.
+        // Наполняется позже через buildMessageElement (безопасный DOM).
+        if (messageKey) {
+            html += `
+                <div id="password-status-box" style="
+                    background: ${statusBg};
+                    border: 1px solid ${statusBorder};
+                    padding: 12px 16px;
+                    border-radius: 4px;
+                    margin-bottom: 20px;
+                    color: ${statusColor};
+                    font-size: 14px;
+                    font-family: Arial, sans-serif;
+                "></div>
+            `;
+        }
+
+        // Прогресс-бар (не показываем для истекшего пароля)
+        if (status !== 'password_expired') {
+            html += `
+                <div style="margin: 20px 0 16px;">
+                    <div style="
+                        display: flex;
+                        justify-content: space-between;
+                        font-size: 13px;
+                        color: #5f6368;
+                        margin-bottom: 6px;
+                        font-family: Arial, sans-serif;
+                    ">
+                        <span>Автоматический вход</span>
+                        <span id="progress-text">${Math.ceil(autoLoginDelay / 1000)}с</span>
+                    </div>
+                    <div style="
+                        width: 100%;
+                        height: 4px;
+                        background: #e8eaed;
+                        border-radius: 2px;
+                        overflow: hidden;
+                    ">
+                        <div id="progress-bar" style="
+                            width: 100%;
+                            height: 100%;
+                            background: #263145;
+                            border-radius: 2px;
+                            transition: width 0.1s linear;
+                        "></div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Кнопки
+        if (status === 'password_expired') {
+            html += `
+                <div style="
+                    display: flex;
+                    gap: 12px;
+                    margin-top: 20px;
+                ">
+                    <button id="btn-try-again" style="
+                        flex: 1;
+                        background: #263145;
+                        color: white;
+                        border: none;
+                        padding: 12px 20px;
+                        border-radius: 4px;
+                        font-size: 14px;
+                        font-weight: 500;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                        font-family: Arial, sans-serif;
+                    ">
+                        Попробовать снова
+                    </button>
+                </div>
+            `;
+        } else {
+            html += `
+                <div style="
+                    display: flex;
+                    gap: 12px;
+                    margin-top: 20px;
+                ">
+                    <button id="btn-auto-login" style="
+                        flex: 1;
+                        background: #263145;
+                        color: white;
+                        border: none;
+                        padding: 12px 20px;
+                        border-radius: 4px;
+                        font-size: 14px;
+                        font-weight: 500;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                        font-family: Arial, sans-serif;
+                    ">
+                        Войти сейчас
+                    </button>
+                    <button id="btn-cancel" style="
+                        padding: 12px 24px;
+                        background: transparent;
+                        color: #5f6368;
+                        border: 1px solid #dadce0;
+                        border-radius: 4px;
+                        font-size: 14px;
+                        font-weight: 500;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                        font-family: Arial, sans-serif;
+                    ">
+                        Отмена
+                    </button>
+                </div>
+            `;
+        }
+
+        panel.innerHTML = html;
+
+        // Вставляем панель
+        loginContainer.parentNode.insertBefore(panel, loginContainer.nextSibling);
+
+        // Наполняем плашку сообщения из конфигурации data.app
+        if (messageKey) {
+            const statusBox = document.getElementById('password-status-box');
+            const messageElement = buildMessageElement(getMessage(messageKey), daysLeft);
+            if (statusBox && messageElement) {
+                statusBox.appendChild(messageElement);
+            }
+        }
+
+        // Добавляем анимации
+        if (!document.getElementById('login-animations')) {
+            const style = document.createElement('style');
+            style.id = 'login-animations';
+            style.textContent = `
+                @keyframes fadeInUp {
+                    from {
+                        opacity: 0;
+                        transform: translateY(20px);
+                    }
+                    to {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        // Запускаем прогресс-бар только если не истек пароль
+        if (status === 'password_expired') {
+            // Для истекшего пароля: без обратного отсчета, только кнопка "Попробовать снова"
+            const tryAgainBtn = document.getElementById('btn-try-again');
+            if (tryAgainBtn) {
+                tryAgainBtn.addEventListener('click', function() {
+                    loginContainer.style.display = '';
+                    panel.remove();
+                    pendingLoginData = null;
+                    if (window.W) window.W(true);
+                });
+            }
+        } else {
+            startProgressBar(autoLoginDelay);
+        }
+    }
+
+    // ====== ЗАПУСК ПРОГРЕСС-БАРА ======
+    function startProgressBar(delay) {
+        let progress = 100;
+        const steps = 20;
+        const stepTime = delay / steps;
+
+        if (autoLoginTimer) {
+            clearTimeout(autoLoginTimer);
+            autoLoginTimer = null;
+        }
+        if (progressTimer) {
+            clearInterval(progressTimer);
+            progressTimer = null;
+        }
+
+        function updateProgress() {
+            progress -= 100 / steps;
+            if (progress <= 0) {
+                progress = 0;
+                clearInterval(progressTimer);
+                performLogin();
+                return;
+            }
+            
+            const progressBar = document.getElementById('progress-bar');
+            const progressText = document.getElementById('progress-text');
+            
+            if (progressBar) {
+                progressBar.style.width = progress + '%';
+            }
+            if (progressText) {
+                const secondsLeft = Math.ceil((progress / 100) * (delay / 1000));
+                progressText.textContent = secondsLeft + 'с';
+            }
+        }
+
+        const loginBtn = document.getElementById('btn-auto-login');
+        if (loginBtn) {
+            loginBtn.addEventListener('click', function() {
+                if (autoLoginTimer) {
+                    clearTimeout(autoLoginTimer);
+                    autoLoginTimer = null;
+                }
+                if (progressTimer) {
+                    clearInterval(progressTimer);
+                    progressTimer = null;
+                }
+                performLogin();
+            });
+        }
+
+        const cancelBtn = document.getElementById('btn-cancel');
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', function() {
+                if (autoLoginTimer) {
+                    clearTimeout(autoLoginTimer);
+                    autoLoginTimer = null;
+                }
+                if (progressTimer) {
+                    clearInterval(progressTimer);
+                    progressTimer = null;
+                }
+                cancelLogin();
+            });
+        }
+
+        progressTimer = setInterval(updateProgress, stepTime);
+        autoLoginTimer = setTimeout(function() {
+            performLogin();
+        }, delay);
+    }
+
+    // ====== ОТМЕНА ЛОГИНА ======
+    function cancelLogin() {
+        const loginContainer = document.getElementById('samoware-login__start');
+        if (loginContainer) {
+            loginContainer.style.display = '';
+        }
+        
+        const panel = document.getElementById('custom-login-panel');
+        if (panel) {
+            panel.remove();
+        }
+        
+        pendingLoginData = null;
+    }
+
+    // ====== ВЫПОЛНЕНИЕ ЛОГИНА ======
+    function performLogin() {
+        if (!pendingLoginData) {
+            console.error('❌ Нет данных для логина');
+            return;
+        }
+
+        const username = pendingLoginData.username;
+        const password = window.p ? window.p.val() : '';
+        
+        $('.samoware-login__siginingin').hide();
+        
+        const loginContainer = document.getElementById('samoware-login__start');
+        if (loginContainer) {
+            loginContainer.style.display = '';
+        }
+        
+        const panel = document.getElementById('custom-login-panel');
+        if (panel) {
+            panel.remove();
+        }
+        
+        if (window.E) {
+            window.E(username, password);
+        } else {
+            const $form = $('#mainFrom');
+            if ($form.length) {
+                $form.off('submit');
+                $form.submit();
+            }
+        }
+        
+        pendingLoginData = null;
+    }
+
+    // ====== ПОКАЗ ОШИБКИ В ПАНЕЛИ ======
+    // messageKey — ключ сообщения из конфигурации data.app ('invalid' | 'error')
+    function showErrorInPanel(messageKey) {
+        $('.samoware-login__siginingin').hide();
+        
+        const loginContainer = document.getElementById('samoware-login__start');
+        if (!loginContainer) return;
+
+        loginContainer.style.display = 'none';
+
+        let panel = document.getElementById('custom-login-panel');
+        if (panel) {
+            panel.remove();
+        }
+
+        panel = document.createElement('div');
+        panel.id = 'custom-login-panel';
+        panel.style.cssText = `
+            animation: fadeInUp 0.5s ease;
+            margin-top: 40px;
+            width: 340px;
+            margin-left: auto;
+            margin-right: auto;
+            position: relative;
+            z-index: 10;
+        `;
+
+        panel.innerHTML = `
+            <div style="
+                text-align: center;
+                padding: 20px 0;
+            ">
+                <div style="
+                    width: 60px;
+                    height: 60px;
+                    border-radius: 50%;
+                    background: #fce8e6;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 32px;
+                    margin-bottom: 16px;
+                ">
+                    ❌
+                </div>
+                <h2 style="
+                    color: #d93025;
+                    font-size: 20px;
+                    font-weight: 500;
+                    margin: 0 0 12px 0;
+                    font-family: Arial, sans-serif;
+                ">
+                    Ошибка входа
+                </h2>
+                <p id="error-message-text" style="
+                    color: #5f6368;
+                    font-size: 14px;
+                    line-height: 1.6;
+                    margin: 0 0 24px 0;
+                    font-family: Arial, sans-serif;
+                "></p>
+                <button id="btn-error-close" style="
+                    background: #263145;
+                    color: white;
+                    border: none;
+                    padding: 10px 32px;
+                    border-radius: 4px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                    font-family: Arial, sans-serif;
+                ">
+                    Попробовать снова
+                </button>
+            </div>
+        `;
+
+        loginContainer.parentNode.insertBefore(panel, loginContainer.nextSibling);
+
+        // Наполняем текст ошибки из конфигурации data.app
+        const errorText = document.getElementById('error-message-text');
+        const messageElement = buildMessageElement(getMessage(messageKey), null);
+        if (errorText && messageElement) {
+            errorText.appendChild(messageElement);
+        }
+
+        document.getElementById('btn-error-close').addEventListener('click', function() {
+            loginContainer.style.display = '';
+            panel.remove();
+            if (window.W) window.W(true);
+        });
+
+        if (!document.getElementById('login-animations')) {
+            const style = document.createElement('style');
+            style.id = 'login-animations';
+            style.textContent = `
+                @keyframes fadeInUp {
+                    from {
+                        opacity: 0;
+                        transform: translateY(20px);
+                    }
+                    to {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    // ====== ПРОВЕРКА УЧЕТНЫХ ДАННЫХ ======
+    function checkCredentials(username, password, callback) {
+        $('.samoware-login__siginingin').hide();
+        $('.samoware-login__error-common').hide();
+        
+        $.ajax({
+            url: CONFIG.AUTH_CHECK_URL,
+            type: 'POST',
+            data: JSON.stringify({ 
+                username: username, 
+                password: password,
+                token: pendingToken || ''
+            }),
+            contentType: 'application/json',
+            dataType: 'json',
+            timeout: CONFIG.TIMEOUT,
+            success: function(response) {
+                callback(null, response);
+            },
+            error: function(xhr, status, error) {
+                callback({ status: status, error: error, xhr: xhr }, null);
+            }
+        });
+    }
+
+    // ====== ПЕРЕХВАТ ФОРМЫ ЛОГИНА ======
+    function setupLoginInterceptor() {
+        if (isSessionActive()) {
+            console.log('✅ Сессия уже активна');
+            return;
+        }
+
+        const isLoginPage = document.querySelector('.samoware-login__login') || 
+                            document.querySelector('input[type="password"]');
+        
+        if (!isLoginPage) {
+            console.log('ℹ️ Не страница логина');
+            return;
+        }
+
+        console.log('🔧 Настраиваем перехват формы');
+
+        setTimeout(function() {
+            const $form = $('#mainFrom');
+            if (!$form.length) {
+                console.error('❌ Форма не найдена');
+                return;
+            }
+
+            $form.off('submit').on('submit', function(e) {
+                e.preventDefault();
+
+                if ($('.samoware-login-sms__start:visible').length > 0 ||
+                    $('.samoware-login__multi-factor-authentication__form:visible').length > 0 ||
+                    $('.samoware-login__change-password__form:visible').length > 0) {
+                    $form.off('submit');
+                    $form.submit();
+                    return;
+                }
+
+                const fields = getLoginFields();
+                let username = '';
+                let password = '';
+                
+                if (fields.username && typeof fields.username.val === 'function') {
+                    username = fields.username.val() || '';
+                }
+                if (fields.password && typeof fields.password.val === 'function') {
+                    password = fields.password.val() || '';
+                }
+
+                if (!username && window.o && typeof window.o.val === 'function') {
+                    username = window.o.val() || '';
+                }
+                if (!password && window.p && typeof window.p.val === 'function') {
+                    password = window.p.val() || '';
+                }
+
+                if (!username) {
+                    const usernameInput = document.querySelector('.samoware-login__login') || 
+                                         document.querySelector('input[name="username"]');
+                    if (usernameInput) username = usernameInput.value || '';
+                }
+                if (!password) {
+                    const passwordInput = document.querySelector('.samoware-login__password') || 
+                                         document.querySelector('input[name="password"]');
+                    if (passwordInput) password = passwordInput.value || '';
+                }
+
+                if (!username || !password) {
+                    $form.off('submit');
+                    $form.submit();
+                    return;
+                }
+
+                if (window.n && username.indexOf('@') < 0) {
+                    const domain = $('#samoware-login__domain-selector').val();
+                    if (domain) {
+                        username += '@' + domain;
+                    }
+                }
+
+                // Обработка ответа acc.app.
+                // isRetry защищает от зацикливания: повтор делается один раз.
+                function handleAuthResponse(err, response, isRetry) {
+                    if (err) {
+                    console.warn('⚠️ Ошибка проверки:', err);
+                    if (window.E) {
+                        window.E(username, password);
+                    } else {
+                        $form.off('submit');
+                        $form.submit();
+                    }
+                    return;
+                }
+
+                // Токен протух/невалиден: молча обновляем и повторяем один раз,
+                    // данные формы сохраняются
+                    if (response.status === 'token' && !isRetry) {
+                        fetchCheckData(function(ok) {
+                            if (!ok) {
+                                showErrorInPanel('token');
+                                return;
+                            }
+                            checkCredentials(username, password, function(err2, response2) {
+                                handleAuthResponse(err2, response2, true);
+                            });
+                        });
+                        return;
+                    }
+
+                    if (response.status === 'token') {
+                        // Повторный отказ после обновления токена
+                        showErrorInPanel('token');
+                    } else if (response.status === 'ok' || response.status === 'expires' || response.status === 'password_expired') {
+                        showUserInfoPanel(response);
+                    } else if (response.status === 'invalid') {
+                        showErrorInPanel('invalid');
+                    } else if (response.status === 'error') {
+                        showErrorInPanel('error');
+                    } else {
+                        // Неизвестный ответ — наша логика не выполняется
+                        console.error('❌ Неизвестный статус ответа acc.app:', response.status);
+                    }
+                }
+
+                checkCredentials(username, password, function(err, response) {
+                    handleAuthResponse(err, response, false);
+                });
+            });
+        }, 500);
+    }
+
+    // ====== КОНФИГ ИЗ DATA.APP (client.acc) ======
+    // Валидируем всё до первого присвоения: конфиг применяется атомарно,
+    // битая секция -> false -> скрипт не активируется.
+    function applyAccConfig(section) {
+        if (!section || typeof section !== 'object') return false;
+
+        const url = section.auth_check_url;
+        if (typeof url !== 'string' || !url || url.charAt(0) !== '/') return false;
+
+        const ints = {
+            TIMEOUT:                 [section.timeout_ms,                  1000,  30000],
+            AUTO_LOGIN_DELAY_OK:     [section.auto_login_delay_ok_ms,      1000,  60000],
+            AUTO_LOGIN_DELAY_EXPIRES:[section.auto_login_delay_expires_ms, 1000,  120000],
+            TOKEN_REFRESH_INTERVAL:  [section.token_refresh_interval_ms,   10000, 3600000],
+        };
+        for (let key in ints) {
+            const value = ints[key][0], lo = ints[key][1], hi = ints[key][2];
+            if (typeof value !== 'number' || !isFinite(value) || value < lo || value > hi) return false;
+        }
+
+        CONFIG.AUTH_CHECK_URL = url;
+        for (let key in ints) CONFIG[key] = ints[key][0];
+        return true;
+    }
+
+    // ====== ЗАГРУЗКА/ОБНОВЛЕНИЕ ДАННЫХ DATA.APP ======
+    function fetchCheckData(callback) {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', CONFIG.IP_CHECK_URL, true);
+        xhr.timeout = CONFIG.TIMEOUT;
+        xhr.setRequestHeader('Accept', 'application/json');
+
+        xhr.onload = function() {
+            if (xhr.status !== 200) {
+                if (callback) callback(false);
+                return;
+            }
+            try {
+                const response = JSON.parse(xhr.responseText);
+                console.log('📥 IP Check:', response);
+
+                if (response.enable !== true) {
+                    console.log('❌ IP запрещён');
+                    if (callback) callback(false);
+                    return;
+                }
+
+                // Строгая валидация: без токена и полного набора сообщений
+                // данные не принимаются вообще
+                if (!validateCheckResponse(response)) {
+                    console.error('❌ Некорректный ответ data.app');
+                    if (callback) callback(false);
+                    return;
+                }
+
+                pendingToken = response.token;
+                pendingMessages = response.messages;
+                pendingClientConfig = (response.client && response.client.acc) || null;
+                if (callback) callback(true);
+            } catch (e) {
+                console.error('Ошибка парсинга:', e);
+                if (callback) callback(false);
+            }
+        };
+
+        xhr.onerror = function() {
+            console.error('Ошибка сети');
+            if (callback) callback(false);
+        };
+
+        xhr.ontimeout = function() {
+            console.error('Таймаут');
+            if (callback) callback(false);
+        };
+
+        xhr.send();
+    }
+
+    // Фоновый рефреш токена: интервал + visibilitychange (троттлинг
+    // таймеров в фоновых вкладках).
+    let tokenRefreshTimer = null;
+
+    function scheduleTokenRefresh() {
+        if (tokenRefreshTimer) return;
+
+        tokenRefreshTimer = setInterval(function() {
+            fetchCheckData(null);
+        }, CONFIG.TOKEN_REFRESH_INTERVAL);
+
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden && pendingToken) {
+                fetchCheckData(null);
+            }
+        });
+    }
+
+    // ====== ПРОВЕРКА IP ======
+    function checkIPAndActivate() {
+        console.log('🔍 Проверяем IP...');
+
+        if (isSessionActive()) {
+            console.log('✅ Сессия активна');
+            return;
+        }
+
+        fetchCheckData(function(ok) {
+            if (!ok) return;
+            // Без валидного конфига из data.app не работаем (fail-closed)
+            if (!applyAccConfig(pendingClientConfig)) {
+                pendingClientConfig = null;
+                return;
+            }
+            pendingClientConfig = null;
+            setupLoginInterceptor();
+            scheduleTokenRefresh();
+        });
+    }
+
+    // ====== ЗАПУСК ======
+    // Попап даты/сервисов и мониторинг сессии — в panel.js.
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', checkIPAndActivate);
+    } else {
+        checkIPAndActivate();
+    }
+
+})();

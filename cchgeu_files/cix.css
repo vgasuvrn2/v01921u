@@ -1,0 +1,37 @@
+.samoware-scroll {
+    -webkit-overflow-scrolling : touch;
+}
+.samoware-content__action_type_videocall{margin-right:-2px;margin: 5px 0 0 16px;
+width: 24px;
+height: 24px;}
+.lastitem{height:10px}
+#samoware-call-group-video .samoware-call__content{background:black;overflow:hidden}
+.blink{-webkit-animation: blink 1s ease-in-out infinite;}
+@-webkit-keyframes blink {
+	0% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.5;
+	}
+	100% {
+		opacity: 1;
+	}
+}
+.samoware-contacts-alphabetNav{position: absolute;
+right: 0;
+padding: 10px 0;
+margin: 10px 20px;
+margin-top: 30px;
+background: rgba(0, 0, 0, .3);
+height: 90%;
+z-index:12; }
+.samoware-contacts-alphabetNav .letter{display:block;padding:0 10px;font-size: 16px;cursor:pointer;
+font-weight: bold;
+color: white;
+font-family: arial;
+box-sizing: border-box;
+vertical-align: middle;}
+.samoware-contacts-alphabetNav .letter:hover{background:#666;}
+.samoware-selector-contacts__item.empty{padding:10px}
+#samoware-add-contact_contact-choose-address .samoware-selector-contacts__item-contact-info {padding-left: 55px;}
